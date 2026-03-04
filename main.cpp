@@ -529,7 +529,11 @@ static bool decrypt_db(const fs::path& input_path,
             // Page size (big-endian)
             full[16] = static_cast<uint8_t>(PAGE_SIZE >> 8);
             full[17] = static_cast<uint8_t>(PAGE_SIZE & 0xFF);
-            full[20] = 0;   // no reserved space in output
+            // Preserve the original reserved-bytes-per-page value (byte 20).
+            // NTQQ's SQLCipher uses reserved=80 for B-tree layout (usable=4016)
+            // even though the crypto reserve (IV+HMAC) is only 48 bytes.
+            // Setting it to 0 would cause SQLite to misinterpret overflow
+            // pointers and report "database disk image is malformed".
             output.insert(output.end(), full.begin(), full.end());
         } else {
             output.insert(output.end(), dec.begin(), dec.end());
@@ -560,7 +564,24 @@ static bool decrypt_db(const fs::path& input_path,
     sqlite3_close(db);
     return table_count > 0;
 }
+// ── Process wait helper ──────────────────────────────────────────────────
 
+static bool is_process_alive(DWORD pid)
+{
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return false;
+    DWORD ret = WaitForSingleObject(h, 0);
+    CloseHandle(h);
+    return ret == WAIT_TIMEOUT;   // still running
+}
+
+static void wait_for_process_exit(DWORD pid, int timeout_sec = 300)
+{
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return;
+    WaitForSingleObject(h, timeout_sec * 1000);
+    CloseHandle(h);
+}
 // ── Argument parsing ────────────────────────────────────────────────────────
 
 struct Args {
@@ -728,11 +749,10 @@ int main(int argc, char** argv)
         }
     }
 
-    // 6. Decrypt all recovered DBs to output folder
+    // 6. Save key_map.json
     fs::path out_dir = fs::current_path() / "output" / args.qq;
     fs::create_directories(out_dir);
 
-    // Save JSON into output folder
     if (!all_results.empty()) {
         auto now = std::chrono::system_clock::now();
         auto t   = std::chrono::system_clock::to_time_t(now);
@@ -752,44 +772,108 @@ int main(int argc, char** argv)
         }
         jf << "  },\n  \"_generated\": \"" << ts << "\"\n}\n";
         jf.close();
-        std::cout << "\nSaved to " << json_path << "\n";
+        std::cout << "\nKey map saved to " << json_path << "\n";
     }
+
+    if (all_results.empty()) {
+        std::cerr << "ERROR: No keys recovered, nothing to decrypt.\n";
+        return 1;
+    }
+
+    // 7. Wait for QQ to close (WAL checkpoint)
+    //    QQ must be closed so that WAL is merged back into the .db files,
+    //    otherwise some tables may appear malformed after decryption.
+    std::cout << "\n" << std::string(72, '=') << "\n"
+              << "  Keys extracted successfully!\n"
+              << "  Please CLOSE QQ now so WAL data is flushed to the database files.\n"
+              << std::string(72, '=') << "\n";
+
+    // Collect all QQ PIDs to monitor
+    auto qq_pids = find_qq_pids();
+    if (qq_pids.empty()) {
+        std::cout << "  QQ is already closed. Proceeding...\n";
+    } else {
+        std::cout << "  Waiting for QQ to exit (PIDs:";
+        for (auto p : qq_pids) std::cout << " " << p;
+        std::cout << ") ...\n"
+                  << "  (or press Enter to proceed without waiting)\n";
+
+        // Poll: wait for all QQ processes to exit, or user presses Enter
+        HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+        while (true) {
+            // Check if any QQ process is still alive
+            bool any_alive = false;
+            for (auto pid : qq_pids) {
+                if (is_process_alive(pid)) {
+                    any_alive = true;
+                    break;
+                }
+            }
+            if (!any_alive) {
+                std::cout << "  QQ has exited.\n";
+                break;
+            }
+
+            // Check if user pressed Enter (non-blocking)
+            INPUT_RECORD ir;
+            DWORD events = 0;
+            if (PeekConsoleInput(hStdin, &ir, 1, &events) && events > 0) {
+                ReadConsoleInput(hStdin, &ir, 1, &events);
+                if (ir.EventType == KEY_EVENT &&
+                    ir.Event.KeyEvent.bKeyDown &&
+                    ir.Event.KeyEvent.wVirtualKeyCode == VK_RETURN) {
+                    std::cout << "  User pressed Enter, proceeding (WAL may not be flushed)...\n";
+                    break;
+                }
+            }
+
+            Sleep(500);
+        }
+    }
+
+    // 8. Brief delay for filesystem to settle
+    Sleep(1000);
+
+    // 9. Re-discover DB files (WAL has been checkpointed, page1 may differ)
+    std::cout << "\n-- Re-reading database files --\n";
+    auto [fresh_global, fresh_pa_map] = find_and_collect_dbs(args.qq, args.db_dir);
+
+    // Build filepath -> key_hex mapping from all_results (salt_hex -> key_hex)
+    // We need to re-match by filepath since salt in page1 is stable across checkpoint
+    std::map<fs::path, std::string> file_key_map;  // filepath -> key_hex
+
+    for (auto& info : fresh_global) {
+        std::string sh = to_hex(info.page1.data(), SALT_SIZE);
+        auto it = all_results.find(sh);
+        if (it != all_results.end())
+            file_key_map[info.filepath] = it->second;
+    }
+    for (auto& [sh, infos] : fresh_pa_map) {
+        auto it = all_results.find(sh);
+        if (it != all_results.end()) {
+            for (auto& info : infos)
+                file_key_map[info.filepath] = it->second;
+        }
+    }
+
+    std::cout << "  Matched " << file_key_map.size() << " database files to keys\n";
+
+    // 10. Decrypt all recovered DBs to output folder
     std::cout << "\n-- Decrypting to " << out_dir << " --\n";
 
     int ok_count = 0, fail_count = 0;
 
-    // Global DBs
-    for (auto& info : global_dbs) {
-        std::string sh = to_hex(info.page1.data(), SALT_SIZE);
-        auto git = global_results.find(sh);
-        if (git == global_results.end()) continue;
-        auto key = from_hex(git->second);
-        auto dst = out_dir / info.filepath.filename();
-        if (decrypt_db(info.filepath, dst, key.data())) {
+    for (auto& [src_path, key_hex] : file_key_map) {
+        auto key = from_hex(key_hex);
+        auto dst = out_dir / src_path.filename();
+        if (decrypt_db(src_path, dst, key.data())) {
             auto sz = fs::file_size(dst) / 1024;
-            std::cout << "  OK  " << info.filepath.filename()
+            std::cout << "  OK  " << src_path.filename()
                       << " (" << sz << " KB)\n";
             ++ok_count;
         } else {
-            std::cout << "  FAIL " << info.filepath.filename() << "\n";
+            std::cout << "  FAIL " << src_path.filename() << "\n";
             ++fail_count;
-        }
-    }
-
-    // Per-account DBs
-    for (auto& [sh, kh] : results) {
-        auto key = from_hex(kh);
-        for (auto& info : pa_salt_map[sh]) {
-            auto dst = out_dir / info.filepath.filename();
-            if (decrypt_db(info.filepath, dst, key.data())) {
-                auto sz = fs::file_size(dst) / 1024;
-                std::cout << "  OK  " << info.filepath.filename()
-                          << " (" << sz << " KB)\n";
-                ++ok_count;
-            } else {
-                std::cout << "  FAIL " << info.filepath.filename() << "\n";
-                ++fail_count;
-            }
         }
     }
 
