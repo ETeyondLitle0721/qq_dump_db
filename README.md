@@ -9,9 +9,11 @@ NTQQ 将聊天记录等数据保存在本地 SQLCipher 加密数据库中，密�
 
 ## 原理
 
-登录 QQ 后，程序通过 `OpenProcess` + `VirtualQueryEx` 遍历 `wrapper.node` 进程的可读内存区域，用正则匹配 `x'<64hex_key><32hex_salt>'` 模式的字符串，几秒内即可精准定位 SQLCipher 密钥与盐值（salt 本身也存储在 db 文件头部，用于交叉验证）。
+程序要求目标 QQ 正在运行。数据库目录不再通过 `%USERPROFILE%\Documents\Tencent Files` 推测：程序使用 `NtQuerySystemInformation(SystemExtendedHandleInformation)` 枚举系统句柄，只筛选 QQ 进程持有的文件句柄，再通过 `DuplicateHandle` 与 `GetFinalPathNameByHandleW` 定位实际打开的 `nt_msg.db`。随后从该路径推导账号数据库目录及同级的全局数据库目录。
 
-拿到密钥后，自动通过 PBKDF2-SHA512 派生解密密钥，对数据库每页执行 AES-256-CBC 解密 + HMAC-SHA1 校验，最终将明文数据写入可直接用 SQLite 打开的 `.db` 文件。
+如果找不到正在打开的 `nt_msg.db`，或者同时发现多个无法与 `--qq` 参数关联的账号路径，程序会明确报错，不会回退到固定目录。`--db-dir` 仍可用于手动指定数据库目录。
+
+找到数据库后，程序读取数据库页头部的 salt，并在 `wrapper.node` 主进程的可读内存区域中查找与该 salt 对应的密钥模式；随后通过 PBKDF2-SHA512、AES-256-CBC 和 HMAC-SHA1 完成数据库页解密与校验。
 
 ## 为什么安全
 
@@ -39,7 +41,10 @@ qq_dump_db.exe --qq <QQ号> --db-dir <目录>   # 可选：手动指定 db 搜�
 ```bash
 pip install cryptography
 python dump_qq_key_auto.py --qq <QQ号>
+python dump_qq_key_auto.py --qq <QQ号> --db-dir <数据库目录>
 ```
+
+自动句柄枚举依赖 Windows Native API，建议使用 64 位 Python 和 64 位程序构建。进程访问权限不足时，请使用有权访问目标 QQ 进程的 Windows 账户运行。
 
 解密后的数据库文件将输出到 `output/<QQ号>/` 目录。
 

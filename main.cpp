@@ -29,6 +29,8 @@
 #include <iomanip>
 #include <chrono>
 #include <ctime>
+#include <cstddef>
+#include <limits>
 
 #include "sqlite3.h"
 
@@ -288,18 +290,229 @@ struct DbInfo {
     std::vector<uint8_t> page1;   // PAGE_SIZE bytes
 };
 
-static fs::path get_nt_db_base()
+// SystemExtendedHandleInformation (SystemInformationClass = 64) is a
+// Windows Native API information class. Keep the declarations local so the
+// code builds with the regular Windows SDK without depending on private SDK
+// headers.
+using NtQuerySystemInformationFn = LONG (NTAPI*)(
+    ULONG, PVOID, ULONG, PULONG);
+
+struct SystemHandleEntryExLocal {
+    PVOID       Object;
+    ULONG_PTR   UniqueProcessId;
+    ULONG_PTR   HandleValue;
+    ULONG       GrantedAccess;
+    USHORT      CreatorBackTraceIndex;
+    USHORT      ObjectTypeIndex;
+    ULONG       HandleAttributes;
+    ULONG       Reserved;
+};
+
+struct SystemHandleInformationExLocal {
+    ULONG_PTR NumberOfHandles;
+    ULONG_PTR Reserved;
+    SystemHandleEntryExLocal Handles[1];
+};
+
+static bool get_final_path_from_handle(HANDLE file_handle, fs::path& result)
 {
-    wchar_t buf[MAX_PATH];
-    ExpandEnvironmentStringsW(
-        L"%USERPROFILE%\\Documents\\Tencent Files", buf, MAX_PATH);
-    return fs::path(buf);
+    constexpr DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
+    DWORD capacity = 512;
+
+    while (capacity <= 32768) {
+        std::vector<wchar_t> buffer(capacity, L'\0');
+        DWORD length = GetFinalPathNameByHandleW(
+            file_handle, buffer.data(), capacity, flags);
+        if (length == 0)
+            return false;
+        if (length < capacity) {
+            result = fs::path(std::wstring(buffer.data(), length));
+            return true;
+        }
+        if (length >= 32768)
+            break;
+        capacity = length + 1;
+    }
+    return false;
+}
+
+static bool path_contains_component(const fs::path& path,
+                                    const std::wstring& component)
+{
+    for (const auto& part : path) {
+        if (_wcsicmp(part.c_str(), component.c_str()) == 0)
+            return true;
+    }
+    return false;
+}
+
+// Locate nt_msg.db by inspecting file handles owned by all running QQ.exe
+// processes. No fixed USERPROFILE/Tencent Files location is assumed.
+static bool find_qq_message_db_directory(const std::string& qq_number,
+                                         const std::vector<DWORD>& input_pids,
+                                         fs::path& db_directory)
+{
+    if (input_pids.empty()) {
+        std::cerr << "ERROR: No QQ process IDs available for handle inspection.\n";
+        return false;
+    }
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    auto query_system_information = ntdll
+        ? reinterpret_cast<NtQuerySystemInformationFn>(
+              GetProcAddress(ntdll, "NtQuerySystemInformation"))
+        : nullptr;
+    if (!query_system_information) {
+        std::cerr << "ERROR: NtQuerySystemInformation is unavailable.\n";
+        return false;
+    }
+
+    constexpr ULONG SYSTEM_EXTENDED_HANDLE_INFORMATION = 64;
+    constexpr LONG STATUS_INFO_LENGTH_MISMATCH_VALUE =
+        static_cast<LONG>(0xC0000004L);
+    constexpr LONG STATUS_BUFFER_TOO_SMALL_VALUE =
+        static_cast<LONG>(0xC0000023L);
+
+    std::vector<uint8_t> handle_buffer;
+    ULONG buffer_size = 1u * 1024u * 1024u;
+    bool queried = false;
+    for (int attempt = 0; attempt < 12; ++attempt) {
+        handle_buffer.resize(buffer_size);
+        ULONG returned_length = 0;
+        LONG status = query_system_information(
+            SYSTEM_EXTENDED_HANDLE_INFORMATION,
+            handle_buffer.data(), buffer_size, &returned_length);
+        if (status >= 0) {
+            queried = true;
+            break;
+        }
+        if (status != STATUS_INFO_LENGTH_MISMATCH_VALUE &&
+            status != STATUS_BUFFER_TOO_SMALL_VALUE) {
+            std::cerr << "ERROR: NtQuerySystemInformation failed (NTSTATUS 0x"
+                      << std::hex << static_cast<uint32_t>(status)
+                      << std::dec << ").\n";
+            return false;
+        }
+        if (returned_length > buffer_size) {
+            buffer_size = returned_length;
+        } else {
+            if (buffer_size > std::numeric_limits<ULONG>::max() / 2) {
+                std::cerr << "ERROR: System handle table is too large.\n";
+                return false;
+            }
+            buffer_size *= 2;
+        }
+    }
+    if (!queried) {
+        std::cerr << "ERROR: Could not allocate a large enough system handle table.\n";
+        return false;
+    }
+
+    const size_t handles_offset =
+        offsetof(SystemHandleInformationExLocal, Handles);
+    if (handle_buffer.size() < handles_offset) {
+        std::cerr << "ERROR: Invalid system handle table response.\n";
+        return false;
+    }
+
+    const auto* handle_info = reinterpret_cast<
+        const SystemHandleInformationExLocal*>(handle_buffer.data());
+    const size_t max_entries =
+        (handle_buffer.size() - handles_offset) /
+        sizeof(SystemHandleEntryExLocal);
+    const size_t handle_count = static_cast<size_t>(
+        std::min<ULONG_PTR>(handle_info->NumberOfHandles, max_entries));
+
+    std::set<DWORD> qq_pid_set(input_pids.begin(), input_pids.end());
+    std::map<DWORD, HANDLE> process_handles;
+    for (DWORD pid : qq_pid_set) {
+        HANDLE process = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
+        if (process)
+            process_handles.emplace(pid, process);
+    }
+    if (process_handles.empty()) {
+        std::cerr << "ERROR: Cannot open any QQ process for handle inspection. "
+                  << "Run with sufficient permissions.\n";
+        return false;
+    }
+
+    std::set<fs::path> found_paths;
+    for (size_t i = 0; i < handle_count; ++i) {
+        const auto& entry = handle_info->Handles[i];
+        if (entry.UniqueProcessId > std::numeric_limits<DWORD>::max())
+            continue;
+        DWORD pid = static_cast<DWORD>(entry.UniqueProcessId);
+        auto process_it = process_handles.find(pid);
+        if (process_it == process_handles.end())
+            continue;
+
+        HANDLE duplicated = nullptr;
+        HANDLE source = reinterpret_cast<HANDLE>(entry.HandleValue);
+        if (!DuplicateHandle(process_it->second, source,
+                             GetCurrentProcess(), &duplicated,
+                             0, FALSE, DUPLICATE_SAME_ACCESS))
+            continue; // The handle may have closed since the snapshot.
+
+        if (GetFileType(duplicated) == FILE_TYPE_DISK) {
+            fs::path file_path;
+            if (get_final_path_from_handle(duplicated, file_path) &&
+                _wcsicmp(file_path.filename().c_str(), L"nt_msg.db") == 0) {
+                found_paths.insert(std::move(file_path));
+            }
+        }
+        CloseHandle(duplicated);
+    }
+
+    for (auto& [pid, process] : process_handles) {
+        (void)pid;
+        CloseHandle(process);
+    }
+
+    if (found_paths.empty()) {
+        std::cerr << "ERROR: No open nt_msg.db file handle was found in QQ processes.\n"
+                  << "Make sure the target QQ account is logged in and its message "
+                  << "database is currently open.\n";
+        return false;
+    }
+
+    std::wstring wanted_account(qq_number.begin(), qq_number.end());
+    std::vector<fs::path> account_matches;
+    for (const auto& path : found_paths) {
+        if (path_contains_component(path, wanted_account))
+            account_matches.push_back(path);
+    }
+
+    const fs::path* selected = nullptr;
+    if (account_matches.size() == 1) {
+        selected = &account_matches.front();
+    } else if (account_matches.size() > 1) {
+        std::cerr << "ERROR: Multiple nt_msg.db paths matched QQ account "
+                  << qq_number << ":\n";
+        for (const auto& path : account_matches)
+            std::cerr << "  " << path.string() << "\n";
+        return false;
+    } else if (found_paths.size() == 1) {
+        // Some NTQQ builds use a directory name that is not the visible QQ ID.
+        selected = &*found_paths.begin();
+    } else {
+        std::cerr << "ERROR: Multiple nt_msg.db files are open, but none could "
+                  << "be associated with QQ account " << qq_number << ":\n";
+        for (const auto& path : found_paths)
+            std::cerr << "  " << path.string() << "\n";
+        return false;
+    }
+
+    db_directory = selected->parent_path();
+    std::cout << "  Located nt_msg.db: " << selected->string() << "\n"
+              << "  Account DB directory: " << db_directory.string() << "\n";
+    return true;
 }
 
 static std::pair<std::vector<DbInfo>,
                  std::map<std::string, std::vector<DbInfo>>>
 find_and_collect_dbs(const std::string& qq_number,
-                     const std::string& custom_db_dir = "")
+                     const std::string& custom_db_dir = "",
+                     const fs::path& discovered_account_db_dir = {})
 {
     std::vector<DbInfo>                        global_dbs;
     std::map<std::string, std::vector<DbInfo>> pa_map;   // salt_hex -> DBs
@@ -316,17 +529,28 @@ find_and_collect_dbs(const std::string& qq_number,
             std::cerr << "ERROR: --db-dir path not found: " << custom << "\n";
         }
     } else {
-        const fs::path base = get_nt_db_base();
+        if (discovered_account_db_dir.empty() ||
+            !fs::is_directory(discovered_account_db_dir)) {
+            std::cerr << "ERROR: Account DB directory was not discovered from "
+                         "QQ process handles.\n";
+            return {global_dbs, pa_map};
+        }
 
-        auto gdir = base / "nt_qq" / "global" / "nt_db";
+        // Expected layout: <data_root>/<account>/nt_qq/nt_db.
+        // Derive the shared root from the located nt_msg.db path, not from
+        // USERPROFILE or a hard-coded Documents directory.
+        const fs::path account_nt_qq_dir = discovered_account_db_dir.parent_path();
+        const fs::path account_root = account_nt_qq_dir.parent_path();
+        const fs::path data_root = account_root.parent_path();
+        const fs::path gdir = data_root / "nt_qq" / "global" / "nt_db";
+
         if (fs::is_directory(gdir))
             dirs.push_back({"global", gdir});
-
-        auto adir = base / qq_number / "nt_qq" / "nt_db";
-        if (fs::is_directory(adir))
-            dirs.push_back({qq_number, adir});
         else
-            std::cerr << "ERROR: DB dir not found: " << adir << "\n";
+            std::cerr << "WARNING: Global DB directory not found: "
+                      << gdir << "\n";
+
+        dirs.push_back({qq_number, discovered_account_db_dir});
     }
 
     static const uint8_t SQLITE_HDR[] = "SQLite header 3";
@@ -629,8 +853,23 @@ int main(int argc, char** argv)
         }
     }
 
-    // 2. Discover DBs
-    auto [global_dbs, pa_salt_map] = find_and_collect_dbs(args.qq, args.db_dir);
+    // 2. Discover the database location. Automatic mode requires an open
+    // nt_msg.db file handle in a running QQ process; there is no fixed-path fallback.
+    fs::path discovered_account_db_dir;
+    if (args.db_dir.empty()) {
+        auto qq_pids = find_qq_pids();
+        if (args.pid && std::find(qq_pids.begin(), qq_pids.end(), args.pid) == qq_pids.end())
+            qq_pids.push_back(args.pid);
+
+        if (!find_qq_message_db_directory(args.qq, qq_pids,
+                                          discovered_account_db_dir)) {
+            return 1;
+        }
+    }
+
+    // 3. Collect database files from the located directories.
+    auto [global_dbs, pa_salt_map] = find_and_collect_dbs(
+        args.qq, args.db_dir, discovered_account_db_dir);
 
     size_t pa_files = 0;
     for (auto& [k, v] : pa_salt_map) pa_files += v.size();
@@ -836,7 +1075,8 @@ int main(int argc, char** argv)
 
     // 9. Re-discover DB files (WAL has been checkpointed, page1 may differ)
     std::cout << "\n-- Re-reading database files --\n";
-    auto [fresh_global, fresh_pa_map] = find_and_collect_dbs(args.qq, args.db_dir);
+    auto [fresh_global, fresh_pa_map] = find_and_collect_dbs(
+        args.qq, args.db_dir, discovered_account_db_dir);
 
     // Build filepath -> key_hex mapping from all_results (salt_hex -> key_hex)
     // We need to re-match by filepath since salt in page1 is stable across checkpoint
