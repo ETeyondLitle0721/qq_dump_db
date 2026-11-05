@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要构建的版本 tag'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -31,5 +37,6 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: qq_dump_db-${{ github.ref_name }}-win-x64.zip
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: qq_dump_db-${{ inputs.tag || github.ref_name }}-win-x64.zip
           generate_release_notes: true
