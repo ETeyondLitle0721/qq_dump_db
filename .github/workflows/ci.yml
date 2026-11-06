@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install static SQLite
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VCPKG_INSTALLATION_ROOT)) {
+            throw "VCPKG_INSTALLATION_ROOT is not configured on this runner."
+          }
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install sqlite3:x64-windows-static
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Run C++ contract tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify executable has no SQLite DLL dependency
+        shell: pwsh
+        run: pwsh -File scripts/verify-static-sqlite.ps1 -Executable build/Release/qq_dump_db.exe
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Python regression tests
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m unittest discover -s tests/python -v

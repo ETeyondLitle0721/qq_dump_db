@@ -93,11 +93,15 @@ Python 依赖 `cryptography`。源码交付包按要求不包含 `third_party/`�
 先通过 vcpkg 安装 SQLite：
 
 ```powershell
-vcpkg install sqlite3:x64-windows
-cmake -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+vcpkg install sqlite3:x64-windows-static
+cmake -S . -B build -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+Release 构建会静态链接 SQLite 和 MSVC C/C++ 运行库。最终的 `qq_dump_db.exe` 不再依赖 `sqlite3.dll`，也不要求用户单独安装 Visual C++ Redistributable（仍使用 Windows 系统自带 DLL）。
 
 C++ CLI 同样支持 `--lang zh-CN|en-US|auto`、`--output-dir` 和 `--no-wait`。`--output` 的相对路径相对于最终输出目录；默认输出为 `./output/<QQ号>/`。
 

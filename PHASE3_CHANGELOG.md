@@ -66,3 +66,12 @@ The GitHub Actions release workflow installs SQLite with vcpkg before configurin
 ## Delivery
 
 `third_party/`, build outputs, local data, Python bytecode, and temporary files are excluded from the phase-3 source archive. C++ users must provide SQLite separately through vcpkg or another system installation.
+
+
+## Packaging hotfix 2.0.1 — static SQLite linkage
+
+- Replaced the generic `SQLite3` finder with the vcpkg `unofficial-sqlite3` package target.
+- Changed the Windows release dependency triplet to `x64-windows-static`.
+- Set the MSVC runtime to static (`/MT`, `/MTd`) so the release executable does not require `sqlite3.dll` or the Visual C++ Redistributable separately.
+- Added a Release PE import audit using `dumpbin /DEPENDENTS`, plus `--version` and `--help` smoke tests.
+- Updated the documented local build instructions and version to 2.0.1.

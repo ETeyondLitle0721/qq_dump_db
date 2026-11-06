@@ -47,7 +47,7 @@ inline constexpr size_t PRE_LOGIN_KEY_LEN = 20;
 inline constexpr size_t SCAN_CHUNK_SIZE = 4ULL * 1024 * 1024;
 inline constexpr size_t KEY_BLOB_SIZE = 99;
 inline constexpr size_t SCAN_OVERLAP = KEY_BLOB_SIZE - 1;
-inline constexpr const char* APP_VERSION = "2.0.0";
+inline constexpr const char* APP_VERSION = "2.0.1";
 inline constexpr uint8_t PRE_LOGIN_KEY[] = "BD156D6710D54D8782F4";
 
 struct Args {

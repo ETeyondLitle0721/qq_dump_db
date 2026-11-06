@@ -34,7 +34,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout):
             code = main(["--version"])
         self.assertEqual(code, 0)
-        self.assertIn("2.0.0", stdout.getvalue())
+        self.assertIn("2.0.1", stdout.getvalue())
 
     def test_invalid_qq_returns_usage_error(self):
         stderr = io.StringIO()

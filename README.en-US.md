@@ -93,11 +93,15 @@ The Python package requires `cryptography`. The source archive intentionally exc
 Install SQLite with vcpkg first:
 
 ```powershell
-vcpkg install sqlite3:x64-windows
-cmake -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+vcpkg install sqlite3:x64-windows-static
+cmake -S . -B build -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static
 cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+The release build statically links SQLite and the MSVC C/C++ runtime. The resulting `qq_dump_db.exe` does not require `sqlite3.dll` or the Visual C++ Redistributable to be installed separately (Windows system DLLs remain required).
 
 The C++ CLI also supports `--lang zh-CN|en-US|auto`, `--output-dir`, and `--no-wait`. Relative `--output` paths are resolved under the output directory; the default output root is `./output/<QQ number>/`.
 

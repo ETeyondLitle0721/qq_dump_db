@@ -37,18 +37,34 @@ jobs:
           if ([string]::IsNullOrEmpty($env:VCPKG_INSTALLATION_ROOT)) {
             throw "VCPKG_INSTALLATION_ROOT is not configured on this runner."
           }
-          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install sqlite3:x64-windows
+          # Static SQLite + static MSVC runtime: the release artifact is a
+          # self-contained application EXE (Windows system DLLs aside).
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install sqlite3:x64-windows-static
 
       - name: Configure CMake
         shell: pwsh
         run: |
-          cmake -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static
 
       - name: Build (Release)
-        run: cmake --build build --config Release
+        run: cmake --build build --config Release --parallel
 
       - name: Run C++ contract tests
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Verify executable has no SQLite DLL dependency
+        shell: pwsh
+        run: pwsh -File scripts/verify-static-sqlite.ps1 -Executable build/Release/qq_dump_db.exe
+
+      - name: Smoke test executable
+        shell: pwsh
+        run: |
+          & "build/Release/qq_dump_db.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "--version smoke test failed." }
+          & "build/Release/qq_dump_db.exe" --help | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "--help smoke test failed." }
 
       - name: Prepare artifacts
         shell: pwsh
@@ -58,6 +74,7 @@ jobs:
           Copy-Item README.md artifact/
           Copy-Item README.zh-CN.md artifact/
           Copy-Item README.en-US.md artifact/
+          if (Test-Path artifact/sqlite3.dll) { throw "sqlite3.dll must not be required or shipped." }
           # 2. 这里的文件名使用统一的环境变量 $env:RELEASE_TAG
           Compress-Archive -Path artifact/* -DestinationPath qq_dump_db-$env:RELEASE_TAG-win-x64.zip
           # 打印出来让你确认文件真的生成了
