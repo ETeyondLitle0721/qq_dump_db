@@ -40,18 +40,27 @@
 - 若多个源文件产生同名目标文件，v1 要显式报冲突而不是沿用当前可能覆盖文件的行为。
 - 只有解密后通过 SQLite 验证的结果才允许成为最终目标文件。
 
-## 3. 需要在后续实现中修改的明确事项
+## 3. 第二阶段实现进度（Python）
 
-1. Python：统一输出根目录、实现等待关闭 QQ 的交互流程，并在等待后重新发现数据库。
-2. C++：完善 CLI 参数校验和 `--help` / `--version`；输出 JSON 增加 `schema_version` 并改用 UTC。
-3. 两端：实现 `--output-dir`、`--lang`、`--no-wait`；统一 `-o` 相对路径规则。
-4. 两端：解密文件先写临时文件，再执行 SQLite 验证，成功后原子替换。
-5. 两端：检测同名解密目标，禁止静默覆盖。
-6. 两端：统一错误 ID、退出码和 stdout/stderr 归属。
+已在 Python 端落实：
 
-## 4. 本阶段不做的事情
+1. 模块化拆分 Win32 API、进程枚举、句柄映射、账号识别、数据库发现、SQLCipher、内存扫描和工作流。
+2. 保留根目录 `dump_qq_key_auto.py` 作为兼容启动器，并增加 `python -m qq_dump_db` / 安装后 `qq-dump-db` 入口。
+3. 实现 `--output-dir`、`--lang auto|zh-CN|en-US`、`--no-wait`、`--version`。
+4. 默认输出统一到 `./output/<QQ号>/`；新 key map 使用 Schema v1 和 UTC 时间。
+5. 实现原子写入、解密临时文件验证、目标文件名冲突保护和稳定错误码。
+6. Python CLI 与 `read_db.py` 支持简体中文和英文；两套文案目录的 Message ID 保持一致。
+7. 默认等待目标 QQ 进程退出，允许等待期间按 Enter 提前继续；跳过等待时提示 WAL 风险。
 
-- 不移动或重写现有 Python/C++ 业务函数。
-- 不改变 SQLCipher 算法参数或内存扫描实现。
+仍待后续 C++ 阶段落实：
+
+- C++ CLI 的 `--output-dir`、`--lang`、`--no-wait`、`--version` 和严格参数校验。
+- C++ 的 Schema v1 UTC JSON 写入、原子文件写入和解密结果验证。
+- C++ 与 Python 的统一错误码、退出码、路径处理及跨语言契约测试。
+
+## 4. 本阶段边界
+
+- 第二阶段只拆分和改造 Python 实现；`main.cpp` 与 CMake 源码未在本阶段重构。
+- SQLCipher 算法参数和现有内存扫描算法保持不变。
 - 不引入 Python/C++ 互操作层。
-- 不在本阶段完成翻译文案；这里只确定 `--lang` 接口及语言选择规则。
+- 当前 Python 国际化只支持简体中文（`zh-CN`）和英文（`en-US`），`auto` 仅为自动选择模式。

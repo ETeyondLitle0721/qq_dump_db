@@ -5,7 +5,7 @@
 ```text
 qq_dump_db --qq <QQ号> [--pid <PID>] [--db-dir <目录>]
            [--output <JSON路径>] [--output-dir <目录>]
-           [--lang <auto|zh-CN|en-US|ja-JP>] [--no-wait]
+           [--lang <auto|zh-CN|en-US>] [--no-wait]
            [--help] [--version]
 
 python dump_qq_key_auto.py --qq <QQ号> [同上参数]
@@ -22,7 +22,7 @@ Python 包化后，`python -m qq_dump_db` 应继续接受相同参数。参数�
 | `--db-dir <目录>` | 否 | 自动发现 | 指定账号数据库目录，必须存在。它覆盖自动发现的账号数据库目录；按当前行为，不从该目录额外推导全局数据库目录。 |
 | `-o, --output <路径>` | 否 | `key_map.json` | 密钥映射 JSON 文件路径。相对路径以最终输出目录为基准；绝对路径按原样使用。 |
 | `--output-dir <目录>` | 否 | `./output/<QQ号>` | 全部默认输出文件的根目录。相对路径以进程当前工作目录为基准；目录不存在时创建。 |
-| `--lang <语言>` | 否 | `auto` | 控制用户可见文案语言。允许 `auto`、`zh-CN`、`en-US`、`ja-JP`。不改变 JSON 字段、错误码或文件名。 |
+| `--lang <语言>` | 否 | `auto` | 控制用户可见文案语言。允许 `auto`、`zh-CN`、`en-US`。不改变 JSON 字段、错误码或文件名。 |
 | `--no-wait` | 否 | 关闭 | 跳过等待 QQ 退出和 WAL 刷新提示，直接重新读取数据库。使用此选项时应打印 WAL 可能尚未完整 checkpoint 的警告。 |
 | `-h, --help` | 否 | — | 显示帮助并以退出码 `0` 结束，不扫描进程。 |
 | `--version` | 否 | — | 显示程序版本并以退出码 `0` 结束，不扫描进程。 |
@@ -60,12 +60,12 @@ Python 包化后，`python -m qq_dump_db` 应继续接受相同参数。参数�
 
 语言解析顺序：
 
-1. `--lang zh-CN|en-US|ja-JP` 显式值；
+1. `--lang zh-CN|en-US` 显式值；
 2. `--lang auto` 或未指定时，读取 `QQ_DUMP_DB_LANG`；
-3. Windows 用户界面语言；
+3. 尝试识别 Windows 用户界面语言或系统 locale，仅映射到中文或英文；
 4. 回退到 `zh-CN`。
 
-环境变量只接受 `zh-CN`、`en-US`、`ja-JP`；无效值视为未设置并继续回退。无法找到某条翻译时，依次回退到 `zh-CN`，最后显示稳定的消息 ID。
+环境变量只接受 `zh-CN`、`en-US`；无效值视为未设置并继续回退。无法找到某条翻译时，依次回退到 `zh-CN`，最后显示稳定的消息 ID。
 
 ## 6. 兼容性约束
 
