@@ -4,7 +4,7 @@ A Windows-only local database utility with C++ and Python implementations. Use i
 
 ## Implementations
 
-- **C++**: existing native implementation (`main.cpp`).
+- **C++**: modular native implementation; the root `main.cpp` is a small entry point and modules live under `cpp/src/` and `cpp/include/`.
 - **Python**: modular package under `python/qq_dump_db/`; the legacy `dump_qq_key_auto.py` remains as a compatible launcher.
 
 The Python CLI supports Simplified Chinese and English (`zh-CN`, `en-US`). The language does not change JSON keys, CLI option names, error IDs, or exit codes. The `read_db.py` viewer also accepts `--lang zh-CN|en-US|auto`.
@@ -84,22 +84,28 @@ python/qq_dump_db/
 shared/                  cross-language CLI / JSON / workflow contracts
 ```
 
-## Third-party dependencies
+## Dependencies
 
-The Python package requires `cryptography`. The source delivery archive intentionally omits `third_party/`; the C++ CMake target expects the SQLite amalgamation to be supplied separately under `third_party/sqlite3/` before building.
+The Python package requires `cryptography`. The source delivery archive intentionally omits `third_party/`. The C++ implementation uses Windows APIs, Windows BCrypt, and SQLite installed separately (for example through vcpkg).
 
 ## C++ build
 
 ```powershell
-cmake -B build -A x64
+vcpkg install sqlite3:x64-windows
+cmake -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
+
+The C++ CLI supports the same `--qq`, `--pid`, `--db-dir`, `-o/--output`, `--output-dir`, `--lang auto|zh-CN|en-US`, `--no-wait`, `--help`, and `--version` options. Relative `--output` paths are resolved under the output directory; the default output root is `./output/<QQ号>/`.
 
 ## Development checks
 
 ```powershell
 python -m pip install -e .
 python -m unittest discover -s tests/python -v
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 See [`shared/`](shared/README.md) for the cross-language contract.

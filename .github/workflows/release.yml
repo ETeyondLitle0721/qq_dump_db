@@ -31,11 +31,24 @@ jobs:
           echo "RELEASE_TAG=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "使用版本号: $version"
 
+      - name: Install SQLite dependency
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty($env:VCPKG_INSTALLATION_ROOT)) {
+            throw "VCPKG_INSTALLATION_ROOT is not configured on this runner."
+          }
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install sqlite3:x64-windows
+
       - name: Configure CMake
-        run: cmake -B build -A x64
+        shell: pwsh
+        run: |
+          cmake -B build -A x64 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build (Release)
         run: cmake --build build --config Release
+
+      - name: Run C++ contract tests
+        run: ctest --test-dir build -C Release --output-on-failure
 
       - name: Prepare artifacts
         shell: pwsh
@@ -43,6 +56,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path artifact
           Copy-Item build/Release/qq_dump_db.exe artifact/
           Copy-Item README.md artifact/
+          Copy-Item README.zh-CN.md artifact/
+          Copy-Item README.en-US.md artifact/
           # 2. 这里的文件名使用统一的环境变量 $env:RELEASE_TAG
           Compress-Archive -Path artifact/* -DestinationPath qq_dump_db-$env:RELEASE_TAG-win-x64.zip
           # 打印出来让你确认文件真的生成了
