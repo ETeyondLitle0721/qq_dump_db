@@ -2,7 +2,8 @@
 Auto-dump NTQQ SQLCipher database keys from a running QQ process.
 
 Zero prior knowledge required - no hardcoded PIDs, keys, addresses, or salts.
-Finds the QQ main process (wrapper.node), scans memory for x'key_salt' patterns.
+Maps QQ instances from nt_msg.db handles, then validates distinct key candidates
+against database page-1 HMACs.
 
 Usage (run as Administrator):
     python dump_qq_key_auto.py --qq 10001
@@ -12,7 +13,7 @@ Usage (run as Administrator):
 import ctypes
 import ctypes.wintypes as wt
 from ctypes import windll, byref, sizeof, create_string_buffer
-import struct, hashlib, hmac as hmac_mod, os, sys, re, time, json, argparse, sqlite3
+import struct, hashlib, hmac as hmac_mod, os, sys, re, time, json, argparse, sqlite3, ntpath
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 # ── Windows API ──────────────────────────────────────────────────────────────
@@ -29,8 +30,9 @@ TH32CS_SNAPPROCESS        = 0x00000002
 TH32CS_SNAPMODULE         = 0x00000008
 TH32CS_SNAPMODULE32       = 0x00000010
 MEM_COMMIT                = 0x1000
-READABLE_PROTS            = {0x02, 0x04, 0x06, 0x08, 0x20, 0x40, 0x60, 0x80}
-MAX_REGION                = 256 * 1024 * 1024
+SCAN_CHUNK_SIZE           = 4 * 1024 * 1024
+KEY_BLOB_SIZE              = 99
+SCAN_OVERLAP               = KEY_BLOB_SIZE - 1
 
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
     _fields_ = [
@@ -176,33 +178,106 @@ def pid_has_module(pid, module_name):
     return found
 
 
-def find_qq_main_pid():
-    pids = find_qq_pids()
-    if not pids:
-        return None
+def find_qq_wrapper_pids(pids=None):
+    if pids is None:
+        pids = find_qq_pids()
     print(f"QQ PIDs: {pids}")
+    wrapper_pids = []
     for pid in pids:
         if pid_has_module(pid, 'wrapper.node'):
-            print(f"  PID {pid} has wrapper.node -> main process")
-            return pid
-    print(f"  WARNING: wrapper.node not found, trying first PID {pids[0]}")
-    return pids[0]
+            wrapper_pids.append(pid)
+            print(f"  PID {pid} has wrapper.node")
+    return wrapper_pids
 
 
 def read_mem(handle, addr, size):
     buf = create_string_buffer(size)
     n = ctypes.c_size_t(0)
-    if _kernel32.ReadProcessMemory(handle, ctypes.c_void_p(addr), buf, size, byref(n)):
-        return buf.raw[:n.value]
-    return None
+    _kernel32.ReadProcessMemory(
+        handle, ctypes.c_void_p(addr), buf, size, byref(n))
+    return buf.raw[:n.value] if n.value else None
 
 
-def find_qq_message_db_directory(qq_number, input_pids):
-    """Find an open nt_msg.db handle owned by a running QQ.exe process.
+def find_qq_process_parent_map():
+    """Return {QQ.exe PID: parent PID} from one Toolhelp process snapshot."""
+    snapshot = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot in (ctypes.c_void_p(-1).value, -1):
+        return {}
+    pe = PROCESSENTRY32()
+    pe.dwSize = sizeof(PROCESSENTRY32)
+    parents = {}
+    if _kernel32.Process32First(snapshot, byref(pe)):
+        while True:
+            name = pe.szExeFile.decode('utf-8', errors='replace').lower()
+            if name == 'qq.exe':
+                parents[int(pe.th32ProcessID)] = int(pe.th32ParentProcessID)
+            if not _kernel32.Process32Next(snapshot, byref(pe)):
+                break
+    _kernel32.CloseHandle(snapshot)
+    return parents
 
-    SystemExtendedHandleInformation is a Windows Native API information class.
-    The returned directory comes from GetFinalPathNameByHandleW; no fixed
-    USERPROFILE/Documents path is assumed.
+
+def parse_qq_account_from_db_path(path):
+    """Parse Tencent Files/<QQ>/nt_qq/nt_db/nt_msg.db strictly."""
+    parts = [part for part in path.replace('/', '\\').split('\\') if part]
+    if len(parts) < 5:
+        return None
+    if parts[-1].lower() != 'nt_msg.db':
+        return None
+    if parts[-2].lower() != 'nt_db' or parts[-3].lower() != 'nt_qq':
+        return None
+    if parts[-5].lower() != 'tencent files':
+        return None
+    account = parts[-4]
+    if not account or not account.isascii() or not account.isdecimal():
+        return None
+    return account
+
+
+def resolve_wrapper_pid_for_handle_owner(owner_pid, wrapper_pids, parent_map):
+    """Correlate a file-handle owner to its wrapper.node QQ process via ancestry."""
+    wrapper_set = set(wrapper_pids)
+    if owner_pid in wrapper_set:
+        return owner_pid
+
+    # A helper process may be a child of the wrapper.node process.
+    visited = set()
+    current = owner_pid
+    while current not in visited:
+        visited.add(current)
+        parent = parent_map.get(current, 0)
+        if not parent:
+            break
+        current = parent
+        if current in wrapper_set:
+            return current
+
+    # Or the file-handle owner may be a QQ.exe parent of wrapper processes.
+    # Only accept one descendant wrapper; never choose arbitrarily among clients.
+    matched_pid = 0
+    for candidate in wrapper_set:
+        visited = set()
+        node = candidate
+        while node not in visited:
+            visited.add(node)
+            parent = parent_map.get(node, 0)
+            if not parent:
+                break
+            node = parent
+            if node == owner_pid:
+                if matched_pid and matched_pid != candidate:
+                    return 0
+                matched_pid = candidate
+                break
+    return matched_pid
+
+
+def find_qq_instance_mappings(input_pids, wrapper_pids):
+    """Map wrapper.node PID -> QQ number using nt_msg.db handle ownership.
+
+    The actual account number is parsed from the handle's resolved file path.
+    A handle owner is associated with a wrapper process only when the QQ.exe
+    parent/child tree identifies a unique relationship.
     """
     if not input_pids:
         raise RuntimeError("No QQ process IDs available for handle inspection.")
@@ -218,7 +293,6 @@ def find_qq_message_db_directory(qq_number, input_pids):
     status_buffer_too_small = ctypes.c_long(0xC0000023).value
     buffer_size = 1024 * 1024
     handle_buffer = None
-
     for _ in range(12):
         handle_buffer = ctypes.create_string_buffer(buffer_size)
         returned_length = wt.ULONG(0)
@@ -234,10 +308,7 @@ def find_qq_message_db_directory(qq_number, input_pids):
             raise RuntimeError(
                 f"NtQuerySystemInformation failed (NTSTATUS 0x{status & 0xFFFFFFFF:08X})."
             )
-        if returned_length.value > buffer_size:
-            buffer_size = returned_length.value
-        else:
-            buffer_size *= 2
+        buffer_size = returned_length.value if returned_length.value > buffer_size else buffer_size * 2
     else:
         raise RuntimeError("Could not allocate a large enough system handle table.")
 
@@ -280,85 +351,110 @@ def find_qq_message_db_directory(qq_number, input_pids):
             process_handles[pid] = process
     if not process_handles:
         raise RuntimeError(
-            "Cannot open any QQ process for handle inspection. "
-            "Run with sufficient permissions."
+            "Cannot open any QQ process for handle inspection. Run with sufficient permissions."
         )
 
-    found_paths = set()
     current_process = kernel32.GetCurrentProcess()
+    found_handles = set()  # (owner PID, normalized path)
     try:
         for entry in entries:
-            pid = int(entry.UniqueProcessId)
-            source_process = process_handles.get(pid)
+            owner_pid = int(entry.UniqueProcessId)
+            source_process = process_handles.get(owner_pid)
             if not source_process:
                 continue
 
             duplicated = wt.HANDLE()
             source_handle = wt.HANDLE(int(entry.HandleValue))
             ok = kernel32.DuplicateHandle(
-                source_process,
-                source_handle,
-                current_process,
-                ctypes.byref(duplicated),
-                0,
-                False,
-                DUPLICATE_SAME_ACCESS,
+                source_process, source_handle, current_process,
+                ctypes.byref(duplicated), 0, False, DUPLICATE_SAME_ACCESS,
             )
             if not ok:
-                continue  # The original handle may have closed after the snapshot.
-
+                continue
             try:
                 if kernel32.GetFileType(duplicated) != FILE_TYPE_DISK:
                     continue
                 path_buffer = ctypes.create_unicode_buffer(32768)
                 length = kernel32.GetFinalPathNameByHandleW(
-                    duplicated,
-                    path_buffer,
-                    len(path_buffer),
+                    duplicated, path_buffer, len(path_buffer),
                     FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
                 )
                 if length == 0 or length >= len(path_buffer):
                     continue
-                path = path_buffer.value
-                if os.path.basename(path).lower() == 'nt_msg.db':
-                    found_paths.add(os.path.normpath(path))
+                path = ntpath.normpath(path_buffer.value)
+                if parse_qq_account_from_db_path(path) is not None:
+                    found_handles.add((owner_pid, path))
             finally:
                 kernel32.CloseHandle(duplicated)
     finally:
         for process in process_handles.values():
             kernel32.CloseHandle(process)
 
-    if not found_paths:
+    if not found_handles:
         raise RuntimeError(
-            "No open nt_msg.db file handle was found in QQ processes. "
-            "Make sure the target QQ account is logged in and its message database is open."
+            "No QQ-owned nt_msg.db handle with the expected "
+            "Tencent Files/<QQ>/nt_qq/nt_db layout was found. "
+            "Make sure QQ is logged in and its message database is open."
         )
 
-    def contains_account_component(path):
-        parts = path.replace('/', '\\').split('\\')
-        return any(part.lower() == str(qq_number).lower() for part in parts)
+    parent_map = find_qq_process_parent_map()
+    mappings = []
+    for owner_pid, path in sorted(found_handles):
+        account = parse_qq_account_from_db_path(path)
+        wrapper_pid = resolve_wrapper_pid_for_handle_owner(
+            owner_pid, wrapper_pids, parent_map)
+        mappings.append({
+            'account': account,
+            'wrapper_pid': wrapper_pid,
+            'handle_pid': owner_pid,
+            'db_path': path,
+        })
 
-    account_matches = sorted(p for p in found_paths if contains_account_component(p))
-    if len(account_matches) == 1:
-        selected = account_matches[0]
-    elif len(account_matches) > 1:
+    print("\nDetected QQ process/account mappings:")
+    for item in mappings:
+        if item['wrapper_pid']:
+            print(
+                f"  PID {item['wrapper_pid']} -> QQ {item['account']} "
+                f"(nt_msg.db handle owner PID {item['handle_pid']})"
+            )
+        else:
+            print(
+                f"  PID ? -> QQ {item['account']} "
+                f"(nt_msg.db handle owner PID {item['handle_pid']}; "
+                "wrapper.node process could not be correlated)"
+            )
+    return mappings
+
+
+def select_qq_instance(qq_number, mappings):
+    account_paths = sorted({
+        item['db_path'] for item in mappings
+        if item['account'] == str(qq_number)
+    })
+    if not account_paths:
+        raise RuntimeError(f"No running QQ instance was mapped to account {qq_number}.")
+    if len(account_paths) != 1:
         raise RuntimeError(
-            "Multiple nt_msg.db paths matched this QQ account:\n  " +
-            "\n  ".join(account_matches)
-        )
-    elif len(found_paths) == 1:
-        # Some NTQQ versions do not use the visible QQ number as the folder name.
-        selected = next(iter(found_paths))
-    else:
-        raise RuntimeError(
-            "Multiple nt_msg.db files are open, but none could be associated "
-            f"with QQ account {qq_number}:\n  " + "\n  ".join(sorted(found_paths))
+            f"Multiple nt_msg.db paths were mapped to QQ account {qq_number}:\n  " +
+            "\n  ".join(account_paths)
         )
 
-    db_directory = os.path.dirname(selected)
-    print(f"  Located nt_msg.db: {selected}")
-    print(f"  Account DB directory: {db_directory}")
-    return db_directory
+    matched_pids = sorted({
+        item['wrapper_pid'] for item in mappings
+        if item['account'] == str(qq_number)
+        and item['db_path'] == account_paths[0]
+        and item['wrapper_pid']
+    })
+    if not matched_pids:
+        raise RuntimeError(
+            f"Located the database for QQ {qq_number}, but could not associate "
+            "its file-handle owner with a wrapper.node process."
+        )
+
+    db_directory = ntpath.dirname(account_paths[0])
+    print(f"  Selected QQ {qq_number} database: {account_paths[0]}")
+    print(f"  Matching wrapper.node PID(s): {matched_pids}")
+    return db_directory, matched_pids
 
 
 def find_db_dirs(qq_number, account_db_dir=None, custom_db_dir=None):
@@ -497,60 +593,84 @@ def decrypt_db(input_path, output_path, enc_key_bytes):
 
 # ── Memory scanner ───────────────────────────────────────────────────────────
 
-HEX_CHARS = set(b'0123456789abcdefABCDEF')
+KEY_BLOB_RE = re.compile(
+    rb"[xX]([\"'])([0-9a-fA-F]{64})([0-9a-fA-F]{32})\1"
+)
 
 
-def scan_by_salt(handle, salt_hexes):
-    """Targeted scan: search memory for known salt hex strings, extract keys.
+def scan_by_salt(handle, pid, salt_hexes):
+    """Find every distinct key blob matching a known database salt.
 
-    Pattern in memory: x'<64hex_key><32hex_salt>'
-    We search for the 32-char salt hex (ASCII) via bytes.find() (C-fast),
-    then back up 66 bytes to verify x' prefix + 64 hex key chars.
+    Memory is read in 4 MiB chunks. A 98-byte overlap preserves a complete
+    99-byte x'<key><salt>' candidate split across adjacent chunks.
+    Returns {salt_hex: [(pid, address, key_hex), ...]}.
     """
-    # Pre-compute salt needles as ASCII bytes
-    needles = [(sh.encode('ascii'), sh) for sh in salt_hexes]
-    results = {}  # salt_hex -> (addr, key_hex)
+    wanted_salts = {sh.lower() for sh in salt_hexes}
+    results = {}
     total = 0
     t0 = time.time()
     mbi = MEMORY_BASIC_INFORMATION()
     addr = 0
+
     while True:
-        ret = _kernel32.VirtualQueryEx(handle, ctypes.c_void_p(addr), byref(mbi), sizeof(mbi))
+        ret = _kernel32.VirtualQueryEx(
+            handle, ctypes.c_void_p(addr), byref(mbi), sizeof(mbi))
         if ret == 0:
             break
+
         base = mbi.BaseAddress or 0
         size = mbi.RegionSize
-        if (mbi.State == MEM_COMMIT and
-                (mbi.Protect & 0xFF) in READABLE_PROTS and
-                0 < size <= MAX_REGION):
-            data = read_mem(handle, base, size)
-            if data:
-                total += len(data)
-                for needle, sh in needles:
-                    if sh in results:
+        protection = int(mbi.Protect)
+        base_protection = protection & 0xFF
+        readable_candidate = (
+            mbi.State == MEM_COMMIT and
+            base_protection != 0x01 and  # PAGE_NOACCESS
+            not (protection & 0x100)    # PAGE_GUARD
+        )
+
+        if readable_candidate and size > 0:
+            carry = b''
+            region_offset = 0
+            while region_offset < size:
+                request = min(SCAN_CHUNK_SIZE, size - region_offset)
+                chunk = read_mem(handle, base + region_offset, request)
+                if not chunk:
+                    region_offset += request
+                    carry = b''
+                    continue
+
+                total += len(chunk)
+                window = carry + chunk
+                window_address = base + region_offset - len(carry)
+                for match in KEY_BLOB_RE.finditer(window):
+                    salt_hex = match.group(3).decode('ascii').lower()
+                    if salt_hex not in wanted_salts:
                         continue
-                    off = 0
-                    while True:
-                        idx = data.find(needle, off)
-                        if idx == -1:
-                            break
-                        # Verify: x'<64hex_key><32hex_salt>'
-                        # salt starts at idx, key starts at idx-64, x' at idx-66
-                        if idx >= 66 and idx + 33 <= len(data):
-                            if (data[idx - 66:idx - 64] == b"x'" and
-                                    data[idx + 32:idx + 33] == b"'" and
-                                    all(c in HEX_CHARS for c in data[idx - 64:idx])):
-                                key_hex = data[idx - 64:idx].decode('ascii').lower()
-                                hit_addr = base + idx - 66
-                                results[sh] = (hit_addr, key_hex)
-                                break
-                        off = idx + 1
+                    key_hex = match.group(2).decode('ascii').lower()
+                    candidates = results.setdefault(salt_hex, [])
+                    if not any(existing[2] == key_hex for existing in candidates):
+                        candidates.append((pid, window_address + match.start(), key_hex))
+
+                keep = min(SCAN_OVERLAP, len(window))
+                carry = window[-keep:] if keep else b''
+                region_offset += len(chunk)
+                if len(chunk) < request:
+                    # A short read leaves a gap; do not bridge it with carry.
+                    region_offset += request - len(chunk)
+                    carry = b''
+
         nxt = base + size
         if nxt <= addr or nxt >= 0x7FFFFFFFFFFF:
             break
         addr = nxt
+
+    candidate_count = sum(len(items) for items in results.values())
     elapsed = time.time() - t0
-    print(f"  Scanned {total / 1048576:.0f} MB in {elapsed:.1f}s -> {len(results)}/{len(salt_hexes)} salts matched")
+    print(
+        f"  PID {pid}: scanned {total / 1048576:.0f} MB in {elapsed:.1f}s "
+        f"-> {len(results)}/{len(wanted_salts)} salts, "
+        f"{candidate_count} distinct candidates"
+    )
     return results
 
 
@@ -559,32 +679,71 @@ def scan_by_salt(handle, salt_hexes):
 def main():
     ap = argparse.ArgumentParser(description="Dump NTQQ database keys from QQ memory")
     ap.add_argument('--qq', required=True, help='QQ number (account directory name)')
-    ap.add_argument('--pid', type=int, default=0, help='QQ.exe PID (auto-detect)')
+    ap.add_argument('--pid', type=int, default=0, help='Explicitly override automatic PID-to-account mapping for diagnostics')
     ap.add_argument('-o', '--output', default='key_map.json', help='Output JSON')
     ap.add_argument('--db-dir', default='', help='Manually specify the database directory')
     args = ap.parse_args()
 
-    # 1. Find QQ main process
-    if args.pid:
-        main_pid = args.pid
-        print(f"Using PID: {main_pid}")
-    else:
-        main_pid = find_qq_main_pid()
-        if not main_pid:
-            print("ERROR: No QQ.exe found. Start QQ or use --pid.")
-            sys.exit(1)
+    # 1. Find all wrapper.node processes, then map each instance to the account
+    # whose nt_msg.db file handle it owns (or whose QQ process tree owns it).
+    qq_pids = find_qq_pids()
+    wrapper_pids = find_qq_wrapper_pids(qq_pids)
+    if not wrapper_pids and not args.pid:
+        print("ERROR: No QQ.exe process with wrapper.node was found. "
+              "Start QQ or specify --pid.")
+        sys.exit(1)
 
-    # 2. Discover DB location from a live QQ file handle (unless explicitly overridden).
+    handle_owner_pids = list(qq_pids)
+    if args.pid and args.pid not in handle_owner_pids:
+        handle_owner_pids.append(args.pid)
+
+    mappings = []
+    try:
+        if handle_owner_pids:
+            mappings = find_qq_instance_mappings(handle_owner_pids, wrapper_pids)
+    except RuntimeError as exc:
+        if not args.db_dir:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+        print(f"WARNING: Automatic PID/account mapping unavailable: {exc}")
+
+    # 2. Resolve the account DB directory and select only its mapped wrapper
+    # process(es). --pid intentionally remains a manual diagnostic override.
     account_db_dir = None
-    if not args.db_dir:
-        qq_pids = find_qq_pids()
-        if args.pid and args.pid not in qq_pids:
-            qq_pids.append(args.pid)
+    if args.db_dir:
+        mapped_pids = sorted({
+            item['wrapper_pid'] for item in mappings
+            if item['account'] == str(args.qq) and item['wrapper_pid']
+        })
+        scan_pids = mapped_pids or wrapper_pids
+        if not mapped_pids:
+            print("WARNING: Could not map --db-dir to this account; "
+                  "scanning all wrapper.node processes.")
+    else:
         try:
-            account_db_dir = find_qq_message_db_directory(args.qq, qq_pids)
+            account_db_dir, scan_pids = select_qq_instance(args.qq, mappings)
         except RuntimeError as exc:
             print(f"ERROR: {exc}")
             sys.exit(1)
+
+    if args.pid:
+        scan_pids = [args.pid]
+        print(f"Using explicit scan PID override: {args.pid}")
+        known = [item for item in mappings if item['wrapper_pid'] == args.pid]
+        if known:
+            for item in known:
+                if item['account'] != str(args.qq):
+                    print(
+                        f"WARNING: PID {args.pid} maps to QQ {item['account']}, "
+                        f"not requested QQ {args.qq}."
+                    )
+                else:
+                    print(f"  PID/account mapping confirmed: {args.pid} -> {args.qq}")
+        else:
+            print(f"WARNING: No file-handle mapping confirmed for PID {args.pid}; "
+                  "proceeding because --pid was explicit.")
+    else:
+        print(f"Will scan {len(scan_pids)} wrapper.node process(es) mapped to QQ {args.qq}.")
 
     # 3. Discover DB files from the located directories.
     try:
@@ -613,28 +772,63 @@ def main():
         else:
             print(f"  [global] {fn}: HMAC mismatch")
 
-    # 4. Per-account DBs: memory scan
+    # 4. Scan each selected process and retain all distinct candidates.
+    # Page-1 HMAC validation, rather than first-match order, selects the key.
     results = {}
     if pa_salt_map:
-        handle = _kernel32.OpenProcess(
-            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, main_pid)
-        if not handle:
-            print(f"Cannot open PID {main_pid} (err {ctypes.GetLastError()})")
-            sys.exit(1)
+        all_scan_hits = {}
+        salt_list = list(pa_salt_map.keys())
+        for pid in scan_pids:
+            handle = _kernel32.OpenProcess(
+                PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
+            if not handle:
+                print(f"  WARNING: Cannot open PID {pid} for memory reading "
+                      f"(err {ctypes.GetLastError()}). Skipping.")
+                continue
+            print(f"\n-- Scanning PID {pid} for {len(salt_list)} known salts --")
+            try:
+                process_hits = scan_by_salt(handle, pid, salt_list)
+            finally:
+                _kernel32.CloseHandle(handle)
 
-        # Targeted salt search: find known salt hex strings in memory
-        print(f"\n-- Scanning PID {main_pid} for {len(pa_salt_map)} known salts --")
-        scan_hits = scan_by_salt(handle, list(pa_salt_map.keys()))
+            for salt_hex, candidates in process_hits.items():
+                merged = all_scan_hits.setdefault(salt_hex, [])
+                for candidate in candidates:
+                    if not any(existing[2] == candidate[2] for existing in merged):
+                        merged.append(candidate)
 
-        for salt_hex, (addr, key_hex) in scan_hits.items():
-            enc_key = bytes.fromhex(key_hex)
-            page1 = pa_salt_map[salt_hex][0][2]
-            if verify_key_hmac(page1, enc_key):
-                results[salt_hex] = key_hex
-                fn = os.path.basename(pa_salt_map[salt_hex][0][1])
-                print(f"  [hit] {fn}: key={key_hex[:16]}.. @ 0x{addr:X}")
+        total_candidates = sum(len(v) for v in all_scan_hits.values())
+        print(f"\nCombined scan results: {len(all_scan_hits)}/{len(salt_list)} salts, "
+              f"{total_candidates} distinct candidate keys across {len(scan_pids)} process(es).")
 
-        _kernel32.CloseHandle(handle)
+        for salt_hex, candidates in all_scan_hits.items():
+            db_entries = pa_salt_map.get(salt_hex, [])
+            verified = False
+            rejected = 0
+            for pid, addr, key_hex in candidates:
+                enc_key = bytes.fromhex(key_hex)
+                verified_entry = next(
+                    (entry for entry in db_entries if verify_key_hmac(entry[2], enc_key)),
+                    None,
+                )
+                if verified_entry is not None:
+                    results[salt_hex] = key_hex
+                    fn = os.path.basename(verified_entry[1])
+                    print(f"  [hit] {fn}: key={key_hex[:16]}.. "
+                          f"@ PID {pid} 0x{addr:X} "
+                          f"(verified after {rejected + 1} candidate(s))")
+                    verified = True
+                    break
+                rejected += 1
+
+            if not verified and db_entries:
+                names = ', '.join(os.path.basename(entry[1]) for entry in db_entries)
+                print(f"  [miss] {names}: {len(candidates)} candidate(s), none passed HMAC")
+
+        for salt_hex, db_entries in pa_salt_map.items():
+            if salt_hex not in all_scan_hits:
+                names = ', '.join(os.path.basename(entry[1]) for entry in db_entries)
+                print(f"  [miss] {names}: no matching key blob found in scanned process(es)")
 
     # 5. Output
     all_results = {**global_results, **results}

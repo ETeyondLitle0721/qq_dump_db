@@ -2,7 +2,8 @@
  * Auto-dump NTQQ SQLCipher database keys from a running QQ process.
  *
  * Zero prior knowledge required - no hardcoded PIDs, keys, addresses, or salts.
- * Finds the QQ main process (wrapper.node), scans memory for x'key_salt' patterns.
+ * Maps QQ instances from nt_msg.db handles, then validates distinct key candidates
+ * against database page-1 HMACs.
  *
  * Usage (run as Administrator):
  *     qq_dump_db.exe --qq 10001
@@ -30,6 +31,7 @@
 #include <chrono>
 #include <ctime>
 #include <cstddef>
+#include <cctype>
 #include <limits>
 
 #include "sqlite3.h"
@@ -55,13 +57,6 @@ static const uint8_t PRE_LOGIN_KEY[]   = "BD156D6710D54D8782F4";
 static constexpr size_t PRE_LOGIN_KEY_LEN = sizeof(PRE_LOGIN_KEY) - 1; // 20
 
 // ── Windows memory scan constants ───────────────────────────────────────────
-
-static constexpr DWORD  MEM_COMMIT_FLAG = 0x1000;
-static constexpr size_t MAX_REGION      = 256ULL * 1024 * 1024;
-
-static const std::set<DWORD> READABLE_PROTS = {
-    0x02, 0x04, 0x06, 0x08, 0x20, 0x40, 0x60, 0x80
-};
 
 // ── Hex utilities ───────────────────────────────────────────────────────────
 
@@ -262,24 +257,21 @@ static bool pid_has_module(DWORD pid, const wchar_t* module_name)
     return found;
 }
 
-static DWORD find_qq_main_pid()
+static std::vector<DWORD> find_qq_wrapper_pids(const std::vector<DWORD>& pids)
 {
-    auto pids = find_qq_pids();
-    if (pids.empty()) return 0;
+    std::vector<DWORD> wrapper_pids;
 
     std::cout << "QQ PIDs:";
-    for (auto p : pids) std::cout << " " << p;
+    for (DWORD pid : pids) std::cout << " " << pid;
     std::cout << "\n";
 
-    for (auto pid : pids) {
+    for (DWORD pid : pids) {
         if (pid_has_module(pid, L"wrapper.node")) {
-            std::cout << "  PID " << pid << " has wrapper.node -> main process\n";
-            return pid;
+            wrapper_pids.push_back(pid);
+            std::cout << "  PID " << pid << " has wrapper.node\n";
         }
     }
-    std::cout << "  WARNING: wrapper.node not found, trying first PID "
-              << pids[0] << "\n";
-    return pids[0];
+    return wrapper_pids;
 }
 
 // ── DB discovery ────────────────────────────────────────────────────────────
@@ -336,22 +328,126 @@ static bool get_final_path_from_handle(HANDLE file_handle, fs::path& result)
     return false;
 }
 
-static bool path_contains_component(const fs::path& path,
-                                    const std::wstring& component)
+static bool equals_ignore_case(const std::wstring& a, const wchar_t* b)
 {
-    for (const auto& part : path) {
-        if (_wcsicmp(part.c_str(), component.c_str()) == 0)
-            return true;
-    }
-    return false;
+    return _wcsicmp(a.c_str(), b) == 0;
 }
 
-// Locate nt_msg.db by inspecting file handles owned by all running QQ.exe
-// processes. No fixed USERPROFILE/Tencent Files location is assumed.
-static bool find_qq_message_db_directory(const std::string& qq_number,
-                                         const std::vector<DWORD>& input_pids,
-                                         fs::path& db_directory)
+static bool parse_qq_account_from_db_path(const fs::path& db_path,
+                                          std::string& account)
 {
+    // Expected NTQQ layout:
+    // <data root>\\Tencent Files\\<QQ number>\\nt_qq\\nt_db\\nt_msg.db
+    if (!equals_ignore_case(db_path.filename().wstring(), L"nt_msg.db"))
+        return false;
+
+    const fs::path db_dir = db_path.parent_path();
+    const fs::path nt_qq_dir = db_dir.parent_path();
+    const fs::path account_dir = nt_qq_dir.parent_path();
+    const fs::path tencent_files_dir = account_dir.parent_path();
+
+    if (!equals_ignore_case(db_dir.filename().wstring(), L"nt_db") ||
+        !equals_ignore_case(nt_qq_dir.filename().wstring(), L"nt_qq") ||
+        !equals_ignore_case(tencent_files_dir.filename().wstring(), L"Tencent Files"))
+        return false;
+
+    const std::wstring account_w = account_dir.filename().wstring();
+    if (account_w.empty() || account_w == L"." || account_w == L"..")
+        return false;
+
+    // QQ account directory names are normally decimal. Reject unexpected
+    // path components rather than accidentally treating a directory as an ID.
+    if (!std::all_of(account_w.begin(), account_w.end(),
+                     [](wchar_t c) { return c >= L'0' && c <= L'9'; }))
+        return false;
+
+    account.clear();
+    account.reserve(account_w.size());
+    for (wchar_t c : account_w)
+        account.push_back(static_cast<char>(c));
+    return true;
+}
+
+struct QqInstanceMapping {
+    std::string account;
+    DWORD       wrapper_pid = 0;  // PID whose address space contains wrapper.node
+    DWORD       handle_pid = 0;   // PID that owns the nt_msg.db file handle
+    fs::path    db_path;
+};
+
+static std::map<DWORD, DWORD> get_qq_parent_map()
+{
+    std::map<DWORD, DWORD> parents;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return parents;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            std::wstring name(pe.szExeFile);
+            std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+            if (name == L"qq.exe")
+                parents[pe.th32ProcessID] = pe.th32ParentProcessID;
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return parents;
+}
+
+static DWORD resolve_wrapper_pid_for_handle_owner(
+    DWORD owner_pid,
+    const std::set<DWORD>& wrapper_pids,
+    const std::map<DWORD, DWORD>& parent_map)
+{
+    if (wrapper_pids.find(owner_pid) != wrapper_pids.end())
+        return owner_pid;
+
+    // First, walk upward: a QQ helper process may inherit its instance from
+    // a wrapper.node-bearing QQ parent.
+    std::set<DWORD> visited;
+    DWORD current = owner_pid;
+    while (visited.insert(current).second) {
+        const auto it = parent_map.find(current);
+        if (it == parent_map.end() || it->second == 0)
+            break;
+        current = it->second;
+        if (wrapper_pids.find(current) != wrapper_pids.end())
+            return current;
+    }
+
+    // Then walk upward from wrapper processes to see whether the handle owner
+    // is their QQ.exe ancestor. Only accept exactly one descendant wrapper;
+    // choosing the "nearest" of several clients could silently mis-map an ID.
+    DWORD matched_pid = 0;
+    for (DWORD candidate : wrapper_pids) {
+        std::set<DWORD> candidate_visited;
+        DWORD node = candidate;
+        while (candidate_visited.insert(node).second) {
+            const auto it = parent_map.find(node);
+            if (it == parent_map.end() || it->second == 0)
+                break;
+            node = it->second;
+            if (node == owner_pid) {
+                if (matched_pid != 0 && matched_pid != candidate)
+                    return 0;
+                matched_pid = candidate;
+                break;
+            }
+        }
+    }
+    return matched_pid;
+}
+
+// Build PID -> QQ account mappings from the process that owns an open nt_msg.db
+// handle. The handle owner's PID is correlated to the wrapper.node process by
+// the QQ.exe parent/child tree. No account is inferred from PID order.
+static bool find_qq_instance_mappings(
+    const std::vector<DWORD>& input_pids,
+    const std::vector<DWORD>& input_wrapper_pids,
+    std::vector<QqInstanceMapping>& mappings)
+{
+    mappings.clear();
     if (input_pids.empty()) {
         std::cerr << "ERROR: No QQ process IDs available for handle inspection.\n";
         return false;
@@ -436,28 +532,35 @@ static bool find_qq_message_db_directory(const std::string& qq_number,
         return false;
     }
 
-    std::set<fs::path> found_paths;
+    const std::set<DWORD> wrapper_set(
+        input_wrapper_pids.begin(), input_wrapper_pids.end());
+    const auto parent_map = get_qq_parent_map();
+    const HANDLE current_process = GetCurrentProcess();
+
+    // Keep PID + path together. A path-only set loses the crucial ownership
+    // information needed to map a QQ instance to its account.
+    std::set<std::pair<DWORD, fs::path>> found_handles;
     for (size_t i = 0; i < handle_count; ++i) {
         const auto& entry = handle_info->Handles[i];
         if (entry.UniqueProcessId > std::numeric_limits<DWORD>::max())
             continue;
-        DWORD pid = static_cast<DWORD>(entry.UniqueProcessId);
-        auto process_it = process_handles.find(pid);
+        const DWORD owner_pid = static_cast<DWORD>(entry.UniqueProcessId);
+        const auto process_it = process_handles.find(owner_pid);
         if (process_it == process_handles.end())
             continue;
 
         HANDLE duplicated = nullptr;
-        HANDLE source = reinterpret_cast<HANDLE>(entry.HandleValue);
-        if (!DuplicateHandle(process_it->second, source,
-                             GetCurrentProcess(), &duplicated,
-                             0, FALSE, DUPLICATE_SAME_ACCESS))
-            continue; // The handle may have closed since the snapshot.
+        const HANDLE source = reinterpret_cast<HANDLE>(entry.HandleValue);
+        if (!DuplicateHandle(process_it->second, source, current_process,
+                             &duplicated, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            continue;
 
         if (GetFileType(duplicated) == FILE_TYPE_DISK) {
             fs::path file_path;
+            std::string account;
             if (get_final_path_from_handle(duplicated, file_path) &&
-                _wcsicmp(file_path.filename().c_str(), L"nt_msg.db") == 0) {
-                found_paths.insert(std::move(file_path));
+                parse_qq_account_from_db_path(file_path, account)) {
+                found_handles.emplace(owner_pid, std::move(file_path));
             }
         }
         CloseHandle(duplicated);
@@ -468,43 +571,99 @@ static bool find_qq_message_db_directory(const std::string& qq_number,
         CloseHandle(process);
     }
 
-    if (found_paths.empty()) {
-        std::cerr << "ERROR: No open nt_msg.db file handle was found in QQ processes.\n"
-                  << "Make sure the target QQ account is logged in and its message "
-                  << "database is currently open.\n";
+    for (const auto& [owner_pid, path] : found_handles) {
+        std::string account;
+        if (!parse_qq_account_from_db_path(path, account))
+            continue;
+        const DWORD wrapper_pid = resolve_wrapper_pid_for_handle_owner(
+            owner_pid, wrapper_set, parent_map);
+        mappings.push_back({account, wrapper_pid, owner_pid, path});
+    }
+
+    if (mappings.empty()) {
+        std::cerr << "ERROR: No QQ-owned nt_msg.db handle with the expected "
+                     "Tencent Files/<QQ>/nt_qq/nt_db layout was found.\n"
+                  << "Make sure QQ is logged in and the message database is open.\n";
         return false;
     }
 
-    std::wstring wanted_account(qq_number.begin(), qq_number.end());
-    std::vector<fs::path> account_matches;
-    for (const auto& path : found_paths) {
-        if (path_contains_component(path, wanted_account))
-            account_matches.push_back(path);
-    }
+    // De-duplicate repeated handle observations while retaining ownership.
+    std::sort(mappings.begin(), mappings.end(),
+              [](const QqInstanceMapping& a, const QqInstanceMapping& b) {
+                  if (a.account != b.account) return a.account < b.account;
+                  if (a.db_path != b.db_path) return a.db_path < b.db_path;
+                  if (a.wrapper_pid != b.wrapper_pid) return a.wrapper_pid < b.wrapper_pid;
+                  return a.handle_pid < b.handle_pid;
+              });
+    mappings.erase(std::unique(mappings.begin(), mappings.end(),
+        [](const QqInstanceMapping& a, const QqInstanceMapping& b) {
+            return a.account == b.account && a.db_path == b.db_path &&
+                   a.wrapper_pid == b.wrapper_pid && a.handle_pid == b.handle_pid;
+        }), mappings.end());
 
-    const fs::path* selected = nullptr;
-    if (account_matches.size() == 1) {
-        selected = &account_matches.front();
-    } else if (account_matches.size() > 1) {
-        std::cerr << "ERROR: Multiple nt_msg.db paths matched QQ account "
+    std::cout << "\nDetected QQ process/account mappings:\n";
+    for (const auto& mapping : mappings) {
+        if (mapping.wrapper_pid) {
+            std::cout << "  PID " << mapping.wrapper_pid << " -> QQ "
+                      << mapping.account << " (nt_msg.db handle owner PID "
+                      << mapping.handle_pid << ")\n";
+        } else {
+            std::cout << "  PID ? -> QQ " << mapping.account
+                      << " (nt_msg.db handle owner PID " << mapping.handle_pid
+                      << "; wrapper.node process could not be correlated)\n";
+        }
+    }
+    return true;
+}
+
+static bool select_qq_instance(
+    const std::string& qq_number,
+    const std::vector<QqInstanceMapping>& mappings,
+    fs::path& db_directory,
+    std::vector<DWORD>& matched_wrapper_pids)
+{
+    std::vector<fs::path> account_paths;
+    for (const auto& mapping : mappings) {
+        if (mapping.account == qq_number)
+            account_paths.push_back(mapping.db_path);
+    }
+    std::sort(account_paths.begin(), account_paths.end());
+    account_paths.erase(std::unique(account_paths.begin(), account_paths.end()),
+                        account_paths.end());
+
+    if (account_paths.empty()) {
+        std::cerr << "ERROR: No running QQ instance was mapped to account "
+                  << qq_number << ".\n";
+        return false;
+    }
+    if (account_paths.size() != 1) {
+        std::cerr << "ERROR: Multiple nt_msg.db paths were mapped to QQ account "
                   << qq_number << ":\n";
-        for (const auto& path : account_matches)
-            std::cerr << "  " << path.string() << "\n";
-        return false;
-    } else if (found_paths.size() == 1) {
-        // Some NTQQ builds use a directory name that is not the visible QQ ID.
-        selected = &*found_paths.begin();
-    } else {
-        std::cerr << "ERROR: Multiple nt_msg.db files are open, but none could "
-                  << "be associated with QQ account " << qq_number << ":\n";
-        for (const auto& path : found_paths)
+        for (const auto& path : account_paths)
             std::cerr << "  " << path.string() << "\n";
         return false;
     }
 
-    db_directory = selected->parent_path();
-    std::cout << "  Located nt_msg.db: " << selected->string() << "\n"
-              << "  Account DB directory: " << db_directory.string() << "\n";
+    db_directory = account_paths.front().parent_path();
+    std::set<DWORD> unique_pids;
+    for (const auto& mapping : mappings) {
+        if (mapping.account == qq_number && mapping.db_path == account_paths.front() &&
+            mapping.wrapper_pid != 0)
+            unique_pids.insert(mapping.wrapper_pid);
+    }
+    matched_wrapper_pids.assign(unique_pids.begin(), unique_pids.end());
+
+    std::cout << "  Selected QQ " << qq_number << " database: "
+              << (account_paths.front()).string() << "\n";
+    if (matched_wrapper_pids.empty()) {
+        std::cout << "  WARNING: No wrapper.node PID could be correlated to this "
+                     "database handle owner.\n";
+    } else {
+        std::cout << "  Matching wrapper.node PID(s):";
+        for (DWORD pid : matched_wrapper_pids)
+            std::cout << " " << pid;
+        std::cout << "\n";
+    }
     return true;
 }
 
@@ -594,19 +753,78 @@ find_and_collect_dbs(const std::string& qq_number,
 // ── Memory scanner ──────────────────────────────────────────────────────────
 
 struct ScanHit {
-    uintptr_t   addr;
-    std::string  key_hex;
+    DWORD       pid = 0;
+    uintptr_t   addr = 0;
+    std::string key_hex;
 };
 
-static std::map<std::string, ScanHit>
-scan_by_salt(HANDLE handle, const std::vector<std::string>& salt_hexes)
+using ScanResults = std::map<std::string, std::vector<ScanHit>>;
+
+static constexpr size_t SCAN_CHUNK_SIZE = 4ULL * 1024 * 1024;
+static constexpr size_t KEY_BLOB_SIZE = 99; // x' + 64 key hex + 32 salt hex + '
+static constexpr size_t SCAN_OVERLAP = KEY_BLOB_SIZE - 1;
+
+static std::string lower_hex(const uint8_t* data, size_t len)
 {
-    std::map<std::string, ScanHit> results;
-    std::set<std::string> remaining(salt_hexes.begin(), salt_hexes.end());
+    std::string value(reinterpret_cast<const char*>(data), len);
+    for (char& c : value)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return value;
+}
+
+static void scan_buffer_for_key_blobs(
+    const std::vector<uint8_t>& data,
+    uintptr_t data_address,
+    DWORD pid,
+    const std::set<std::string>& wanted_salts,
+    ScanResults& results)
+{
+    if (data.size() < KEY_BLOB_SIZE) return;
+
+    for (size_t i = 0; i + KEY_BLOB_SIZE <= data.size(); ++i) {
+        const uint8_t prefix = data[i];
+        if ((prefix != 'x' && prefix != 'X') ||
+            (data[i + 1] != '\'' && data[i + 1] != '"'))
+            continue;
+
+        const uint8_t quote = data[i + 1];
+        if (data[i + KEY_BLOB_SIZE - 1] != quote)
+            continue;
+
+        bool all_hex = true;
+        for (size_t j = i + 2; j < i + KEY_BLOB_SIZE - 1; ++j) {
+            if (!is_hex_char(data[j])) {
+                all_hex = false;
+                break;
+            }
+        }
+        if (!all_hex) continue;
+
+        const std::string key_hex = lower_hex(data.data() + i + 2, 64);
+        const std::string salt_hex = lower_hex(data.data() + i + 66, 32);
+        if (wanted_salts.find(salt_hex) == wanted_salts.end())
+            continue;
+
+        auto& candidates = results[salt_hex];
+        const auto duplicate = std::find_if(
+            candidates.begin(), candidates.end(),
+            [&](const ScanHit& hit) { return hit.key_hex == key_hex; });
+        if (duplicate == candidates.end())
+            candidates.push_back({pid, data_address + i, key_hex});
+    }
+}
+
+static ScanResults scan_by_salt(
+    HANDLE handle,
+    DWORD pid,
+    const std::vector<std::string>& salt_hexes)
+{
+    ScanResults results;
+    const std::set<std::string> wanted_salts(
+        salt_hexes.begin(), salt_hexes.end());
 
     size_t total = 0;
-    auto t0 = std::chrono::steady_clock::now();
-
+    const auto t0 = std::chrono::steady_clock::now();
     MEMORY_BASIC_INFORMATION mbi{};
     uintptr_t addr = 0;
 
@@ -615,87 +833,96 @@ scan_by_salt(HANDLE handle, const std::vector<std::string>& salt_hexes)
                            &mbi, sizeof(mbi)) == 0)
             break;
 
-        auto base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-        size_t size = mbi.RegionSize;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const size_t size = mbi.RegionSize;
+        const DWORD protection = mbi.Protect;
+        const DWORD base_protection = protection & 0xFF;
+        const bool readable_candidate =
+            mbi.State == MEM_COMMIT &&
+            base_protection != PAGE_NOACCESS &&
+            (protection & PAGE_GUARD) == 0;
 
-        if (mbi.State == MEM_COMMIT &&
-            READABLE_PROTS.count(mbi.Protect & 0xFF) &&
-            size > 0 && size <= MAX_REGION)
-        {
-            std::vector<uint8_t> data(size);
-            SIZE_T bytes_read = 0;
-            if (ReadProcessMemory(handle, reinterpret_cast<LPCVOID>(base),
-                                  data.data(), size, &bytes_read) &&
-                bytes_read > 0)
-            {
-                data.resize(bytes_read);
-                total += bytes_read;
+        if (readable_candidate && size > 0) {
+            std::vector<uint8_t> carry;
+            size_t region_offset = 0;
 
-                for (auto it = remaining.begin(); it != remaining.end(); ) {
-                    const std::string& sh = *it;
-                    const auto* needle =
-                        reinterpret_cast<const uint8_t*>(sh.c_str());
-                    const size_t nlen = sh.size();   // 32
+            while (region_offset < size) {
+                const size_t request = std::min(
+                    SCAN_CHUNK_SIZE, size - region_offset);
+                std::vector<uint8_t> chunk(request);
+                SIZE_T bytes_read = 0;
+                const BOOL read_ok = ReadProcessMemory(
+                    handle,
+                    reinterpret_cast<LPCVOID>(base + region_offset),
+                    chunk.data(), request, &bytes_read);
 
-                    bool found = false;
-                    size_t off = 0;
-                    while (off + nlen <= bytes_read) {
-                        auto pos = std::search(
-                            data.begin() + off,
-                            data.begin() + bytes_read,
-                            needle, needle + nlen);
-                        if (pos == data.begin() + static_cast<ptrdiff_t>(bytes_read))
-                            break;
+                if (bytes_read > 0) {
+                    chunk.resize(static_cast<size_t>(bytes_read));
+                    total += static_cast<size_t>(bytes_read);
 
-                        size_t idx = static_cast<size_t>(
-                            pos - data.begin());
+                    std::vector<uint8_t> window;
+                    window.reserve(carry.size() + chunk.size());
+                    window.insert(window.end(), carry.begin(), carry.end());
+                    window.insert(window.end(), chunk.begin(), chunk.end());
+                    const uintptr_t window_address =
+                        base + region_offset - carry.size();
 
-                        // Verify pattern: x'<64 hex key><32 hex salt>'
-                        if (idx >= 66 && idx + 33 <= bytes_read &&
-                            data[idx - 66] == 'x' &&
-                            data[idx - 65] == '\'' &&
-                            data[idx + 32] == '\'')
-                        {
-                            bool all_hex = true;
-                            for (size_t j = idx - 64; j < idx; ++j) {
-                                if (!is_hex_char(data[j])) {
-                                    all_hex = false;
-                                    break;
-                                }
-                            }
-                            if (all_hex) {
-                                std::string key_hex(
-                                    data.begin() + idx - 64,
-                                    data.begin() + idx);
-                                std::transform(key_hex.begin(),
-                                               key_hex.end(),
-                                               key_hex.begin(), ::tolower);
-                                results[sh] = {base + idx - 66, key_hex};
-                                found = true;
-                                break;
-                            }
-                        }
-                        off = idx + 1;
+                    scan_buffer_for_key_blobs(
+                        window, window_address, pid, wanted_salts, results);
+
+                    const size_t keep = std::min(SCAN_OVERLAP, window.size());
+                    carry.assign(window.end() - static_cast<ptrdiff_t>(keep),
+                                 window.end());
+
+                    region_offset += static_cast<size_t>(bytes_read);
+                    if (!read_ok || bytes_read < request) {
+                        // Do not let a blob span bytes that were not read.
+                        region_offset += request - static_cast<size_t>(bytes_read);
+                        carry.clear();
                     }
-
-                    if (found) it = remaining.erase(it);
-                    else       ++it;
+                } else {
+                    region_offset += request;
+                    carry.clear();
                 }
             }
         }
 
-        uintptr_t nxt = base + size;
-        if (nxt <= addr || nxt >= 0x7FFFFFFFFFFF) break;
-        addr = nxt;
+        const uintptr_t next = base + size;
+        if (next <= addr || next >= 0x7FFFFFFFFFFF)
+            break;
+        addr = next;
     }
 
-    double elapsed = std::chrono::duration<double>(
+    size_t candidate_count = 0;
+    for (const auto& [salt, candidates] : results) {
+        (void)salt;
+        candidate_count += candidates.size();
+    }
+    const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
-    std::cout << "  Scanned " << (total / 1048576) << " MB in "
-              << std::fixed << std::setprecision(1) << elapsed << "s -> "
-              << results.size() << "/" << salt_hexes.size()
-              << " salts matched\n";
+    std::cout << "  PID " << pid << ": scanned " << (total / 1048576)
+              << " MB in " << std::fixed << std::setprecision(1)
+              << elapsed << "s -> " << results.size() << "/"
+              << salt_hexes.size() << " salts, " << candidate_count
+              << " distinct candidates\n";
     return results;
+}
+
+static void merge_scan_results(ScanResults& destination,
+                               const ScanResults& source)
+{
+    for (const auto& [salt, candidates] : source) {
+        auto& merged = destination[salt];
+        for (const auto& candidate : candidates) {
+            const auto duplicate = std::find_if(
+                merged.begin(), merged.end(),
+                [&](const ScanHit& hit) {
+                    return hit.key_hex == candidate.key_hex;
+                });
+            if (duplicate == merged.end())
+                merged.push_back(candidate);
+        }
+    }
 }
 
 // ── Page / DB decryption ────────────────────────────────────────────────────
@@ -840,31 +1067,84 @@ int main(int argc, char** argv)
 {
     auto args = parse_args(argc, argv);
 
-    // 1. Find QQ main process
-    DWORD main_pid;
-    if (args.pid) {
-        main_pid = args.pid;
-        std::cout << "Using PID: " << main_pid << "\n";
-    } else {
-        main_pid = find_qq_main_pid();
-        if (!main_pid) {
-            std::cerr << "ERROR: No QQ.exe found. Start QQ or use --pid.\n";
+    // 1. Discover QQ processes and the account each wrapper.node instance
+    // belongs to. Account identity is derived from the nt_msg.db handle path,
+    // not from process order or the mere presence of wrapper.node.
+    const auto qq_pids = find_qq_pids();
+    const auto wrapper_pids = find_qq_wrapper_pids(qq_pids);
+    if (wrapper_pids.empty() && !args.pid) {
+        std::cerr << "ERROR: No QQ.exe process with wrapper.node was found. "
+                     "Start QQ or specify --pid.\n";
+        return 1;
+    }
+
+    std::vector<DWORD> handle_owner_pids = qq_pids;
+    if (args.pid && std::find(handle_owner_pids.begin(), handle_owner_pids.end(),
+                              args.pid) == handle_owner_pids.end())
+        handle_owner_pids.push_back(args.pid);
+
+    std::vector<QqInstanceMapping> instance_mappings;
+    const bool mapping_available = !handle_owner_pids.empty() &&
+        find_qq_instance_mappings(handle_owner_pids, wrapper_pids, instance_mappings);
+
+    // 2. Select the database directory and the wrapper process(es) associated
+    // with --qq. An explicit --pid remains a diagnostic override.
+    std::vector<DWORD> scan_pids;
+    fs::path discovered_account_db_dir;
+    if (args.db_dir.empty()) {
+        if (!mapping_available ||
+            !select_qq_instance(args.qq, instance_mappings,
+                                discovered_account_db_dir, scan_pids)) {
             return 1;
+        }
+        if (scan_pids.empty() && !args.pid) {
+            std::cerr << "ERROR: The database path was identified, but no "
+                         "wrapper.node PID could be mapped to QQ " << args.qq << ".\n";
+            return 1;
+        }
+    } else {
+        // A manually supplied DB directory is authoritative. If automatic
+        // mapping succeeded, narrow the scan to matching instances; otherwise
+        // keep the previous all-wrapper-process diagnostic behavior.
+        if (mapping_available) {
+            for (const auto& mapping : instance_mappings) {
+                if (mapping.account == args.qq && mapping.wrapper_pid != 0)
+                    scan_pids.push_back(mapping.wrapper_pid);
+            }
+            std::sort(scan_pids.begin(), scan_pids.end());
+            scan_pids.erase(std::unique(scan_pids.begin(), scan_pids.end()),
+                            scan_pids.end());
+        }
+        if (scan_pids.empty()) {
+            scan_pids = wrapper_pids;
+            std::cout << "WARNING: Could not map --db-dir to a live QQ instance; "
+                         "scanning all wrapper.node processes.\n";
         }
     }
 
-    // 2. Discover the database location. Automatic mode requires an open
-    // nt_msg.db file handle in a running QQ process; there is no fixed-path fallback.
-    fs::path discovered_account_db_dir;
-    if (args.db_dir.empty()) {
-        auto qq_pids = find_qq_pids();
-        if (args.pid && std::find(qq_pids.begin(), qq_pids.end(), args.pid) == qq_pids.end())
-            qq_pids.push_back(args.pid);
-
-        if (!find_qq_message_db_directory(args.qq, qq_pids,
-                                          discovered_account_db_dir)) {
-            return 1;
+    if (args.pid) {
+        scan_pids.assign(1, args.pid);
+        std::cout << "Using explicit scan PID override: " << args.pid << "\n";
+        bool pid_account_known = false;
+        for (const auto& mapping : instance_mappings) {
+            if (mapping.wrapper_pid == args.pid) {
+                pid_account_known = true;
+                if (mapping.account != args.qq) {
+                    std::cerr << "WARNING: PID " << args.pid
+                              << " maps to QQ " << mapping.account
+                              << ", not requested QQ " << args.qq << ".\n";
+                } else {
+                    std::cout << "  PID/account mapping confirmed: "
+                              << args.pid << " -> " << args.qq << "\n";
+                }
+            }
         }
+        if (!pid_account_known)
+            std::cout << "WARNING: No file-handle mapping was confirmed for PID "
+                      << args.pid << "; proceeding because --pid was explicit.\n";
+    } else {
+        std::cout << "Will scan " << scan_pids.size()
+                  << " wrapper.node process(es) mapped to QQ " << args.qq << ".\n";
     }
 
     // 3. Collect database files from the located directories.
@@ -899,38 +1179,106 @@ int main(int argc, char** argv)
         }
     }
 
-    // 4. Per-account DBs: memory scan
-    std::map<std::string, std::string> results;          // salt_hex -> key_hex
+    // 4. Per-account DBs: scan each selected process, retain all distinct
+    // candidates for each salt, and let HMAC verification choose the key.
+    std::map<std::string, std::string> results; // salt_hex -> verified key_hex
     if (!pa_salt_map.empty()) {
-        HANDLE handle = OpenProcess(
-            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, main_pid);
-        if (!handle) {
-            std::cerr << "Cannot open PID " << main_pid
-                      << " (err " << GetLastError() << ")\n";
-            return 1;
-        }
-
         std::vector<std::string> salt_list;
         salt_list.reserve(pa_salt_map.size());
-        for (auto& [k, v] : pa_salt_map) salt_list.push_back(k);
+        for (const auto& [salt, dbs] : pa_salt_map) {
+            (void)dbs;
+            salt_list.push_back(salt);
+        }
 
-        std::cout << "\n-- Scanning PID " << main_pid << " for "
-                  << salt_list.size() << " known salts --\n";
-        auto scan_hits = scan_by_salt(handle, salt_list);
+        ScanResults all_scan_hits;
+        for (DWORD pid : scan_pids) {
+            HANDLE process = OpenProcess(
+                PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+            if (!process) {
+                std::cerr << "  WARNING: Cannot open PID " << pid
+                          << " for memory reading (err " << GetLastError()
+                          << "). Skipping.\n";
+                continue;
+            }
 
-        for (auto& [salt_hex, hit] : scan_hits) {
-            auto enc_key = from_hex(hit.key_hex);
-            auto& page1  = pa_salt_map[salt_hex][0].page1;
-            if (verify_key_hmac(page1.data(), enc_key.data())) {
-                results[salt_hex] = hit.key_hex;
-                auto fn = pa_salt_map[salt_hex][0].filepath.filename().string();
-                std::cout << "  [hit] " << fn << ": key="
-                          << hit.key_hex.substr(0, 16) << ".. @ 0x"
-                          << std::hex << std::uppercase << hit.addr
-                          << std::dec << "\n";
+            std::cout << "\n-- Scanning PID " << pid << " for "
+                      << salt_list.size() << " known salts --\n";
+            const auto process_hits = scan_by_salt(process, pid, salt_list);
+            merge_scan_results(all_scan_hits, process_hits);
+            CloseHandle(process);
+        }
+
+        size_t total_candidates = 0;
+        for (const auto& [salt, candidates] : all_scan_hits) {
+            (void)salt;
+            total_candidates += candidates.size();
+        }
+        std::cout << "\nCombined scan results: " << all_scan_hits.size()
+                  << "/" << salt_list.size() << " salts, "
+                  << total_candidates << " distinct candidate keys across "
+                  << scan_pids.size() << " process(es).\n";
+
+        for (const auto& [salt_hex, candidates] : all_scan_hits) {
+            const auto db_it = pa_salt_map.find(salt_hex);
+            if (db_it == pa_salt_map.end() || db_it->second.empty())
+                continue;
+
+            bool verified = false;
+            size_t rejected = 0;
+            for (const auto& hit : candidates) {
+                const auto enc_key = from_hex(hit.key_hex);
+                if (enc_key.size() != KEY_SIZE) {
+                    ++rejected;
+                    continue;
+                }
+
+                // If several DB files share a salt, try each page-1 HMAC.
+                // A damaged first DB must not reject an otherwise valid key.
+                std::string verified_filename;
+                for (const auto& db : db_it->second) {
+                    if (verify_key_hmac(db.page1.data(), enc_key.data())) {
+                        verified_filename = db.filepath.filename().string();
+                        break;
+                    }
+                }
+
+                if (!verified_filename.empty()) {
+                    results[salt_hex] = hit.key_hex;
+                    std::cout << "  [hit] " << verified_filename
+                              << ": key=" << hit.key_hex.substr(0, 16)
+                              << ".. @ PID " << hit.pid << " 0x"
+                              << std::hex << std::uppercase << hit.addr
+                              << std::dec << " (verified after "
+                              << (rejected + 1) << " candidate(s))\n";
+                    verified = true;
+                    break;
+                }
+                ++rejected;
+            }
+
+            if (!verified) {
+                std::string names;
+                for (const auto& db : db_it->second) {
+                    if (!names.empty()) names += ", ";
+                    names += db.filepath.filename().string();
+                }
+                std::cout << "  [miss] " << names << ": "
+                          << candidates.size()
+                          << " candidate(s), none passed HMAC\n";
             }
         }
-        CloseHandle(handle);
+
+        for (const auto& [salt, dbs] : pa_salt_map) {
+            if (all_scan_hits.find(salt) == all_scan_hits.end()) {
+                std::string names;
+                for (const auto& db : dbs) {
+                    if (!names.empty()) names += ", ";
+                    names += db.filepath.filename().string();
+                }
+                std::cout << "  [miss] " << names
+                          << ": no matching key blob found in scanned process(es)\n";
+            }
+        }
     }
 
     // 5. Output summary
@@ -1028,12 +1376,12 @@ int main(int argc, char** argv)
               << std::string(72, '=') << "\n";
 
     // Collect all QQ PIDs to monitor
-    auto qq_pids = find_qq_pids();
-    if (qq_pids.empty()) {
+    auto remaining_qq_pids = find_qq_pids();
+    if (remaining_qq_pids.empty()) {
         std::cout << "  QQ is already closed. Proceeding...\n";
     } else {
         std::cout << "  Waiting for QQ to exit (PIDs:";
-        for (auto p : qq_pids) std::cout << " " << p;
+        for (auto p : remaining_qq_pids) std::cout << " " << p;
         std::cout << ") ...\n"
                   << "  (or press Enter to proceed without waiting)\n";
 
@@ -1042,7 +1390,7 @@ int main(int argc, char** argv)
         while (true) {
             // Check if any QQ process is still alive
             bool any_alive = false;
-            for (auto pid : qq_pids) {
+            for (auto pid : remaining_qq_pids) {
                 if (is_process_alive(pid)) {
                     any_alive = true;
                     break;
