@@ -6,8 +6,8 @@ Maps QQ instances from nt_msg.db handles, then validates distinct key candidates
 against database page-1 HMACs.
 
 Usage (run as Administrator):
-    python dump_qq_key_auto.py --qq 10001
-    python dump_qq_key_auto.py --qq 10001 --pid 12345
+    python dump_db.py --qq 10001
+    python dump_db.py --qq 10001 --pid 12345
 """
 
 import ctypes

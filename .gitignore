@@ -2,3 +2,5 @@ out
 build
 CMakePresets.json
 output
+.git.old
+*.zip
