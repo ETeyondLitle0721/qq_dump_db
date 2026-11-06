@@ -65,3 +65,6 @@ cmake --build build --config Release
 MIT
 
 转载或引用请注明来源：[https://github.com/NapNeko/qq_dump_db](https://github.com/NapNeko/qq_dump_db)
+## 开发与维护规范
+
+Python 与 C++ 两种实现的命令行参数、输出格式、错误码和处理流程统一定义在 [`shared/`](shared/README.md) 中。开始拆分或修改实现前，请先阅读该目录下的规范；跨语言验收项见 [`shared/contract-tests.md`](shared/contract-tests.md)。
